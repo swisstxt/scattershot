@@ -7,7 +7,7 @@ rate to observe behavior of the server under load.
 
 ## Requirements
 
-Python 3.6, uses only built-in standard libraries.
+Python 3.6, only built-in standard libraries are used.
 
 The tested server/URLs must support range requests.
 
@@ -25,6 +25,14 @@ For more options, see:
 ```shell
 $ scattershot --help
 ```
+
+## Details
+
+Concurrency is handled by the Python asyncio framework.
+
+This has one serious drawback, however: All requests run in a single thread and
+simply yield execution when they are waiting for I/O, which can lead to
+contention when there is too much work going on.
 
 ## Copyright
 
