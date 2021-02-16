@@ -32,18 +32,25 @@ class Counter(object):
         return ret
 
 class CustomResolver(aiohttp.abc.AbstractResolver):
-    """ A custom DNS resolver that always returns the same address"""
+    """ A custom DNS resolver that returns a static response, choosing one IP randomly from a pool"""
 
-    def __init__(self, staticip):
-        self.ip = staticip
+    def __init__(self, staticips, rnd=None):
+        super().__init__()
+        self.ips = staticips
+        if rnd is not None:
+            self.rnd = rnd
+        else:
+            self.rnd = random.Random()
 
     async def close():
         pass
 
     async def resolve(self, host, port=None, family=None):
+        ip = self.rnd.choice(self.ips)
+        log.debug(f"Return IP: {ip}")
         return [{
             "hostname": host,
-            "host": self.ip,
+            "host": ip,
             "port": port,
             "family": family,
             "proto": socket.IPPROTO_TCP,
@@ -51,28 +58,28 @@ class CustomResolver(aiohttp.abc.AbstractResolver):
         }]
 
 class Request(object):
-    def __init__(self, url, method='GET', headers=dict(), ip=None, readall=True):
+    def __init__(self, url, resolver, method='GET', headers=dict(), readall=True):
         self.method = method
         self.url = url
         self.headers = headers
         self.readall = readall
-        self.resolver = CustomResolver(ip)
+        self.connector = aiohttp.TCPConnector(resolver=resolver, force_close=True)
 
     def __str__(self):
-        return f"method={self.method} url={self.url} ip={self.resolver.ip} readall={self.readall} headers=[{', '.join(k+': '+v for k, v in self.headers.items())}]"
+        return f"method={self.method} url={self.url} readall={self.readall} headers=[{', '.join(k+': '+v for k, v in self.headers.items())}]"
 
     def __await__(self):
         return self.send().__await__()
 
     async def send(self):
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=self.resolver)) as session:
+        async with aiohttp.ClientSession(connector=self.connector) as session:
             async with session.request(self.method, self.url, headers=self.headers) as response:
                 if self.readall:
                     await response.content.read()
                 return response
 
 class Scatter(object):
-    def __init__(self, url, runtime, parallel=1, rps=1, range=-1, size=-1, ramp=0, ips=None, seed=None):
+    def __init__(self, url, runtime, parallel=1, rps=1, range=-1, size=-1, ramp=0, ips=None, seed=None, grace=10):
         self.url = url
         self.parallel = parallel
         self.range = range
@@ -87,7 +94,8 @@ class Scatter(object):
         self.rnd = random.Random()
         if seed is not None:
             self.rnd.seed(seed)
-        self.grace = 3
+        self.grace = grace
+        self.resolver = None
 
     def __str__(self):
         return f"urls={self.url} ips=[{', '.join(self.ips)}] parallel={self.parallel} rps={self.rps} range={self.range}, size={self.size} ramp={self.ramp} runtime={self.runtime}"
@@ -104,8 +112,9 @@ class Scatter(object):
                 port = None
             # TODO use asyncio.get_event_loop().getaddrinfo() instead
             self.ips = [addr[4][0] for addr in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)]
+        self.resolver = CustomResolver(self.ips, self.rnd)
         if self.size < 0:
-            result = await Request(self.url, method='HEAD', ip=self.ips[0])
+            result = await Request(self.url, self.resolver, method='HEAD')
             log.debug(f"HEAD request result: {', '.join(result.headers)}")
             if result.headers.get('Accept-Ranges') != "bytes" or 'Content-Length' not in result.headers:
                 raise RuntimeError("Server does not support range requests")
@@ -122,42 +131,44 @@ class Scatter(object):
         headers = {
             'Range': f"bytes={lower}-{upper}",
         }
-        req = Request(self.url, headers=headers, ip=self.ips[0], readall=True)
+        req = Request(self.url, self.resolver, headers=headers, readall=True)
         async def coro(delay, sem, req):
             await asyncio.sleep(delay)
-            log.debug(f"Sending: {req}")
+            log.debug(f"Wall clock: {delay} seconds, sending: {req}")
             async with sem:
                 return await req
         return coro(delay, sem, req)
 
     async def run(self):
-        loop = asyncio.get_event_loop()
         sem = asyncio.Semaphore(self.parallel)
+        # logging task
         async def stage(delay, message, level=logging.INFO):
             await asyncio.sleep(delay)
             log.log(level, message)
-        counter = 0
         tasks = []
-        tasks.append(stage(counter, f"Stage: Ramp-up"))
+        tasks.append(stage(0, f"Wall clock: 0 seconds | Stage: Ramp-up"))
         for step in range(self.ramp):
-            tasks.append(stage(counter, f"Wall clock: {counter} seconds", logging.DEBUG))
-            # schedule step tasks, each with the wallclock delay
-            tasks.extend([self.makereq(counter, sem) for _ in range(int(self.rps*step/self.ramp))])
-            counter += 1
-        tasks.append(stage(counter, f"Stage: Run"))
-        for _ in range(self.runtime):
-            tasks.append(stage(counter, f"Wall clock: {counter} seconds", logging.DEBUG))
-            # schedule rps tasks, each with the wallclock delay
-            tasks.extend([self.makereq(counter, sem) for _ in range(self.rps)])
-            counter += 1
-        tasks.append(stage(counter, f"Stage: Ramp-down"))
-        for step in range(self.ramp-1 , -1, -1):
-            tasks.append(stage(counter, f"Wall clock: {counter} seconds", logging.DEBUG))
-            # schedule step tasks, each with the wallclock delay
-            tasks.extend([self.makereq(counter, sem) for _ in range(int(self.rps*step/self.ramp))])
-            counter += 1
+            prorate = int(self.rps * step / self.ramp)
+            log.debug(f"Step: {step} Prorate: {prorate}")
+            for index in range(prorate):
+                clock = step + index / prorate
+                # schedule tasks, each with the calculated wallclock delay
+                tasks.append(self.makereq(clock, sem))
+        tasks.append(stage(self.ramp, f"Wall clock: {self.ramp} seconds | Stage: Run | Rate: {self.rps} requests/second"))
+        for index in range(self.runtime*self.rps):
+            clock = self.ramp + index / self.rps
+            # schedule tasks, each with the calculated wallclock delay
+            tasks.append(self.makereq(clock, sem))
+        tasks.append(stage(self.ramp+self.runtime, f"Wall clock: {self.ramp+self.runtime} seconds | Stage: Ramp-down"))
+        for step in range(self.ramp):
+            prorate = int(self.rps * (1.0 - step / self.ramp))
+            log.debug(f"Step: {step} Prorate: {prorate}")
+            for index in range(prorate):
+                clock = self.ramp + self.runtime + step + index / prorate
+                # schedule tasks, each with the calculated wallclock delay
+                tasks.append(self.makereq(clock, sem))
         try:
-            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), self.ramp+self.runtime+self.ramp+self.grace)
+            result = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), self.ramp+self.runtime+self.ramp+self.grace)
         except asyncio.exceptions.TimeoutError:
             log.warning(f"Tasks still running after shutdown and grace period")
 
