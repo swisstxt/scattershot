@@ -48,6 +48,7 @@ class CustomResolver(aiohttp.abc.AbstractResolver):
     async def resolve(self, host, port=None, family=None):
         ip = self.rnd.choice(self.ips)
         log.debug(f"Return IP: {ip}")
+        # TODO this should take into account which addresses are IPv4 and which are IPv6
         return [{
             "hostname": host,
             "host": ip,
@@ -79,7 +80,7 @@ class Request(object):
                 return response
 
 class Scatter(object):
-    def __init__(self, url, runtime, parallel=1, rps=1, range=-1, size=-1, ramp=0, ips=None, seed=None, grace=10):
+    def __init__(self, url, runtime, parallel=1, rps=1, range=[0, -1], size=-1, ramp=0, ips=None, seed=None, grace=10, readall=False):
         self.url = url
         self.parallel = parallel
         self.range = range
@@ -96,9 +97,10 @@ class Scatter(object):
             self.rnd.seed(seed)
         self.grace = grace
         self.resolver = None
+        self.readall = readall
 
     def __str__(self):
-        return f"urls={self.url} ips=[{', '.join(self.ips)}] parallel={self.parallel} rps={self.rps} range={self.range}, size={self.size} ramp={self.ramp} runtime={self.runtime}"
+        return f"urls={self.url} ips=[{', '.join(self.ips)}] parallel={self.parallel} rps={self.rps} range={self.range[0]}..{self.range[1]}, size={self.size} ramp={self.ramp} runtime={self.runtime}"
 
     async def prepare(self):
         if self.ips is None:
@@ -119,22 +121,25 @@ class Scatter(object):
             if result.headers.get('Accept-Ranges') != "bytes" or 'Content-Length' not in result.headers:
                 raise RuntimeError("Server does not support range requests")
             self.size = int(result.headers['Content-Length'])
-        if self.range < 0:
-            self.range = 0
-        if self.range > self.size:
-            self.range = self.size
+        if self.range[0] < 0:
+            self.range[0] = 0
+        if self.range[0] > self.size:
+            self.range[0] = self.size
+        if self.range[1] < 0 or self.range[1] > self.size:
+            self.range[1] = self.size
 
     def makereq(self, delay, sem):
-        """Generates a request coroutine that waits for delay seconds and the semaphore, then send out a random request"""
-        lower = self.rnd.randint(0, self.size-self.range)
-        upper = self.rnd.randint(lower, lower+self.range)
+        """Generates a request coroutine that waits for delay seconds and the semaphore, then sends out a random-sized range request"""
+        rlen = self.rnd.randint(*self.range)
+        lower = self.rnd.randint(0, self.size-rlen)
+        upper = lower + rlen
         headers = {
             'Range': f"bytes={lower}-{upper}",
         }
-        req = Request(self.url, self.resolver, headers=headers, readall=True)
+        req = Request(self.url, self.resolver, headers=headers, readall=self.readall)
         async def coro(delay, sem, req):
             await asyncio.sleep(delay)
-            log.debug(f"Wall clock: {delay} seconds, sending: {req}")
+            log.debug(f"Wall clock: {delay} seconds, sending: {req} size={rlen}")
             async with sem:
                 return await req
         return coro(delay, sem, req)
@@ -177,11 +182,13 @@ async def main():
         parser = argparse.ArgumentParser()
         parser.add_argument('--parallel', default=1, type=int, help="Maximum number of parallel requests")
         parser.add_argument('--rps', default=1, type=int, help="Requests to schedule each second")
-        parser.add_argument('--range', default=-1, type=int, help="Maximumg size of each range request")
+        parser.add_argument('--maxrange', default=-1, type=int, help="Maximum size of each range request (asset size is used if unspecified)")
+        parser.add_argument('--minrange', default=0, type=int, help="Minimum size of each range request")
         parser.add_argument('--size', default=-1, type=int, help="Static asset size, send a HEAD request first if unspecified")
         parser.add_argument('--ramp', default=0, type=int, help="Ramp-up and ramp-down time in seconds, rps is scaled up/down in this time period, use 0 to disable ramping")
         parser.add_argument('--runtime', required=True, type=int, help="Test run time in seconds, not counting ramp-up and ramp-down")
         parser.add_argument('--resolve', default=None, type=str, help="List of static target IPs, comma-separated (if not set, the result from a DNS resolution of the first URL will be used)")
+        parser.add_argument('--fullauto', action="store_true", help="Send request, but don't wait for the content")
         parser.add_argument('--verbose', action="store_true", help="Enable verbose logging")
         parser.add_argument('url', type=str, nargs='+', help="URL to test (multiple URLs are acceptable, they will be tested one-by-one)")
         args = parser.parse_args()
@@ -191,7 +198,7 @@ async def main():
             log.debug("Debug logging enabled")
 
         for url in args.url:
-            tester = Scatter(url=url, parallel=args.parallel, range=args.range, size=args.size, ramp=args.ramp, ips=args.resolve, rps=args.rps, runtime=args.runtime)
+            tester = Scatter(url=url, parallel=args.parallel, range=[args.minrange, args.maxrange], size=args.size, ramp=args.ramp, ips=args.resolve, rps=args.rps, runtime=args.runtime, readall=not args.fullauto)
 
             await tester.prepare()
             log.info(f"Starting test with parameters: {tester}")
