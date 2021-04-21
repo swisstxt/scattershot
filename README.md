@@ -38,4 +38,4 @@ contention when there is too much work going on.
 
 Copyright © 2021 SWISS TXT
 
-All rights reserved.
+Licensed under the Simplified BSD License. See the LICENSE file for details.
